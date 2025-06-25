@@ -178,3 +178,121 @@ int main() {
     free(Q); free(K); free(V); free(A);
     return 0;
 }
+
+/*
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+
+#define EPS 1e-6
+
+// A) Matrix multiplication: C = A(n×k) * B(k×m)
+void matmul(double *A, int n, int k, double *B, int m, double *C) {
+    for(int i=0;i<n;i++){
+        for(int j=0;j<m;j++){
+            double s = 0.0;
+            for(int t=0;t<k;t++) s += A[i*k+t] * B[t*m+j];
+            C[i*m+j] = s;
+        }
+    }
+}
+
+// B) Transpose: At = A^T
+void transpose(double *A, int n, int m, double *At){
+    for(int i=0;i<n;i++) for(int j=0;j<m;j++)
+        At[j*n + i] = A[i*m + j];
+}
+
+// C) Symmetry check for square matrix A (n×n)
+int is_symmetric(double *A, int n){
+    for(int i=0;i<n;i++) for(int j=i+1;j<n;j++)
+        if(fabs(A[i*n+j] - A[j*n+i]) > EPS) return 0;
+    return 1;
+}
+
+// D) Compare two matrices of size n×n
+int is_equal(double *A, double *B, int n){
+    for(int i=0;i<n*n;i++)
+        if(fabs(A[i] - B[i]) > EPS) return 0;
+    return 1;
+}
+
+// E) Gaussian elimination rank estimation
+int matrix_rank(double *M, int n, int m){
+    int rank = 0;
+    double *A = malloc(n*m*sizeof(double));
+    memcpy(A, M, n*m*sizeof(double));
+    for(int c=0, r=0; c<m && r<n; c++){
+        // find pivot row
+        int piv = r;
+        for(int i=r+1;i<n;i++)
+            if(fabs(A[i*m+c]) > fabs(A[piv*m+c])) piv=i;
+        if(fabs(A[piv*m+c]) < EPS) continue;
+        // swap
+        if(piv != r){
+            for(int j=c;j<m;j++){
+                double tmp = A[piv*m+j];
+                A[piv*m+j] = A[r*m+j];
+                A[r*m+j] = tmp;
+            }
+        }
+        // eliminate below
+        for(int i=r+1;i<n;i++){
+            double f = A[i*m+c]/A[r*m+c];
+            for(int j=c;j<m;j++)
+                A[i*m+j] -= f * A[r*m+j];
+        }
+        r++; rank++;
+    }
+    free(A);
+    return rank;
+}
+
+// F) Power method to estimate dominant eigenvalue of symmetric square A (n×n)
+double power_eigen(double *A, int n){
+    double *x = calloc(n, sizeof(double)), *y = calloc(n,sizeof(double));
+    for(int i=0;i<n;i++) x[i]=1.0; // initial guess
+    double lambda=0, lambda_old;
+    do {
+        for(int i=0;i<n;i++){
+            y[i]=0.0;
+            for(int j=0;j<n;j++) y[i]+=A[i*n+j] * x[j];
+        }
+        // normalize y to get new x
+        lambda_old = lambda;
+        lambda = fabs(y[0]);
+        for(int i=1;i<n;i++) if(fabs(y[i])>lambda) lambda=fabs(y[i]);
+        for(int i=0;i<n;i++) x[i] = y[i]/lambda;
+    } while(fabs(lambda - lambda_old) > EPS);
+    free(x); free(y);
+    return lambda;
+}
+
+int main(){
+    int n=3, m=2;  // example
+    double Q[6] = {1,2,3, 4,5,6};  // 3×2
+
+    double Qt[6]; transpose(Q,n,m,Qt);
+    double QQt[9]; matmul(Q,n,m,Qt,n,QQt);
+
+    double QQt2[9]; matmul(QQt,n,n,QQt,n,QQt2);
+
+    double QQtQ[6]; matmul(QQt,n,n,Q,m,QQtQ);
+
+    // 1. Symmetry
+    printf("QQ^T symmetric? %s\n", is_symmetric(QQt,n)?"Yes":"No");
+    printf("(QQ^T)Q symmetric? %s\n", (n==m && is_symmetric(QQtQ,n))?"Yes":"Likely No");
+
+    // 2. Idempotence of QQ^T
+    printf("Idempotent? (QQ^T)^2 = QQ^T? %s\n", is_equal(QQt, QQt2, n)?"Yes":"No");
+
+    // 3. Rank
+    printf("rank(QQ^T Q) = %d, rank(Q) = %d\n", matrix_rank(QQtQ,n,m), matrix_rank(Q,n,m));
+
+    // 4. Positive eigenvalue check (dominant only)
+    double e = power_eigen(QQtQ, n);
+    printf("Dominant eigenvalue of (QQ^T)Q ≈ %.6f (>=0)? %s\n", e, e>=-EPS?"Yes":"No");
+
+    return 0;
+}
+*/
