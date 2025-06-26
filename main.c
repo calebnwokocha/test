@@ -3,8 +3,10 @@
 #include <string.h>
 #include <math.h>
 #include <omp.h>
+#include <float.h>
 
-#define LEAF_SIZE 64   // threshold for switching to classical multiplication
+#define LEAF_SIZE 64    // threshold for switching to classical multiplication
+#define PAD -1.0        // sentinel for padding slots
 
 // Allocate a zeroed square matrix of size n×n
 static double* alloc_matrix(int n) {
@@ -21,20 +23,21 @@ static int next_pow2(int x) {
 }
 
 // Classical multiplication: C += A × B, size r×r
-static void classical_mul(double *A, double *B, double *C, int r) {
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int i = 0; i < r; i++)
+static void classical_mul(const double *A, const double *B, double *C, int r) {
+    #pragma omp parallel for collapse(2) schedule(dynamic)
+    for (int i = 0; i < r; i++) {
         for (int k = 0; k < r; k++) {
             double aik = A[i*r + k];
             for (int j = 0; j < r; j++)
                 C[i*r + j] += aik * B[k*r + j];
         }
+    }
 }
 
 // Add/Subtract: C = A ± B over r×r
-static void add_sub(double *A, double *B, double *C, int r, int sign) {
+static void add_sub(const double *A, const double *B, double *C, int r, int sign) {
     int n2 = r * r;
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel for schedule(dynamic)
     for (int i = 0; i < n2; i++)
         C[i] = A[i] + sign * B[i];
 }
@@ -103,77 +106,108 @@ static void strassen_rec(double *A, double *B, double *C, int r) {
     free(P1); free(P2); free(P3); free(P4); free(P5); free(P6); free(P7);
 }
 
-// Wrapper: multiply Q (n×k) × Q^T (k×m) → K (n×m)
-static void strassen_mul(double *A, int n, int k,
-                         double *B, int kb, int m,
-                         double *C) {
-    int S = next_pow2(((n>m?n:m)>k? (n>m?n:m) : k));
-    double *Ap = alloc_matrix(S);
-    double *Bp = alloc_matrix(S);
-    double *Cp = alloc_matrix(S);
+// Multiply square matrices A and B (n×n) into C (n×n)
+static void strassen_mul_square(const double *A, const double *B, int n, double *C) {
+    int S = next_pow2(n);
+    double *Ap = alloc_matrix(S), *Bp = alloc_matrix(S), *Cp = alloc_matrix(S);
 
-    for (int i = 0; i < n; i++)
-        memcpy(Ap + i*S, A + i*k, k * sizeof(double));
-    for (int i = 0; i < k; i++)
-        memcpy(Bp + i*S, B + i*m, m * sizeof(double));
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; i++) memcpy(Ap + i*S, A + i*n, n * sizeof(double));
+
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; i++) memcpy(Bp + i*S, B + i*n, n * sizeof(double));
 
     #pragma omp parallel
-    #pragma omp single
+    #pragma omp single nowait
     strassen_rec(Ap, Bp, Cp, S);
 
-    for (int i = 0; i < n; i++)
-        memcpy(C + i*m, Cp + i*S, m * sizeof(double));
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; i++) memcpy(C + i*n, Cp + i*S, n * sizeof(double));
 
     free(Ap); free(Bp); free(Cp);
 }
 
+// Encode text into Q (n×n) with sentinel padding
+static void encode_with_sentinel(const unsigned char *text, double *Q, size_t n) {
+    #pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < n; i++) {
+        size_t base = i * n;
+        Q[base] = (double)text[i];
+        for (size_t j = 1; j < n; j++) {
+            Q[base + j] = PAD;
+        }
+    }
+}
+
+// Decode with sentinel (for verification)
+static unsigned char* decode_with_sentinel(const double *Q, size_t n) {
+    unsigned char *text = malloc(n);
+    if (!text) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        double v = Q[i * n];
+        if (v == PAD || v < 0.0 || v > 255.0 || v != floor(v)) {
+            free(text);
+            return NULL;
+        }
+        text[i] = (unsigned char)v;
+    }
+    return text;
+}
+
 int main() {
+    omp_set_num_threads(omp_get_max_threads());
     while (1) {
-        int n, m;
-        printf("Enter n (rows of Q) and m (columns of Q), separated by space: ");
-        fflush(stdout);
-        if (scanf("%d %d", &n, &m) != 2) {
-            fprintf(stderr, "Invalid input for n and m.\n");
+        int n;
+        printf("Enter n (text length and matrix dimension): "); fflush(stdout);
+        if (scanf("%d", &n) != 1 || n <= 0) {
+            fprintf(stderr, "Invalid input for n.\n");
             return EXIT_FAILURE;
         }
 
-        double *Q = malloc((size_t)n * m * sizeof(double));
-        double *K = calloc((size_t)n * n, sizeof(double));
-        double *V = calloc((size_t)n * m, sizeof(double));
-        int *A = malloc((size_t)n * m * sizeof(int));
-        if (!Q || !K || !V || !A) { perror("malloc"); return EXIT_FAILURE; }
-
-        printf("Enter the %d x %d entries of Q, row by row:\n", n, m);
-        for (int i = 0; i < n*m; i++) {
-            if (scanf("%lf", &Q[i]) != 1) {
-                fprintf(stderr, "Invalid matrix entry.\n");
-                return EXIT_FAILURE;
-            }
+        // Read exact-length text
+        unsigned char *text = malloc(n + 1);
+        if (!text) { perror("malloc"); return EXIT_FAILURE; }
+        printf("Enter text (%d chars): ", n);
+        scanf(" ");
+        fgets((char*)text, n+1, stdin);
+        if (strlen((char*)text) < (size_t)n) {
+            fprintf(stderr, "Text too short.\n");
+            free(text);
+            return EXIT_FAILURE;
         }
 
-        // Compute K = Q x Q^T
-        strassen_mul(Q, n, m, Q, m, n, K);
+        size_t size = n;
+        double *Q = malloc(size * size * sizeof(double)); // Query
+        double *K = calloc(size * size, sizeof(double)); // Key
+        double *V = calloc(size * size, sizeof(double)); // Value
+        int    *A = malloc(size * size * sizeof(int));
+        if (!Q || !K || !V || !A) { perror("malloc"); return EXIT_FAILURE; }
 
-        // Compute V = K x Q
-        strassen_mul(K, n, n, Q, m, m, V);
+        // Encode text into square Q
+        encode_with_sentinel(text, Q, size);
+        free(text);
 
-        printf("Q^T is transpose of Q. Result of V = (Q x Q^T) x Q:\n");
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j < m; j++)
-                printf("%.6g%s", V[i*m + j], j+1<m ? " " : "");
+        // Compute K = Q × Q and V = K × Q
+        strassen_mul_square(Q, Q, size, K);
+        strassen_mul_square(K, Q, size, V);
+
+        // Print V
+        printf("Result of V = Q × Q × Q:\n");
+        for (int i = 0; i < size; i++) {
+            for (int j = 0; j < size; j++)
+                printf("%.6g%s", V[i*size + j], j+1<size ? " " : "");
             printf("\n");
         }
 
-        // Compute A based on V: A[i] = 1 if V[i] > 0, else 0
-        #pragma omp parallel for schedule(static)
-        for (int i = 0; i < n * m; i++) {
+        // Build A (1 if V>0, else 0)
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t i = 0; i < size*size; i++)
             A[i] = (V[i] > 0.0) ? 1 : 0;
-        }
 
-        printf("Matrix A (1 if corresponding V > 0, else 0):\n");
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j < m; j++)
-                printf("%d%s", A[i*m + j], j+1<m ? " " : "");
+        printf("Matrix A (1 if V>0 else 0):\n");
+        for (int i = 0; i < size; i++) {
+            for (int j = 0; j < size; j++)
+                printf("%d%s", A[i*size + j], j+1<size ? " " : "");
             printf("\n");
         }
 
@@ -182,121 +216,3 @@ int main() {
     }
     return 0;
 }
-
-/*
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
-
-#define EPS 1e-6
-
-// A) Matrix multiplication: C = A(n×k) * B(k×m)
-void matmul(double *A, int n, int k, double *B, int m, double *C) {
-    for(int i=0;i<n;i++){
-        for(int j=0;j<m;j++){
-            double s = 0.0;
-            for(int t=0;t<k;t++) s += A[i*k+t] * B[t*m+j];
-            C[i*m+j] = s;
-        }
-    }
-}
-
-// B) Transpose: At = A^T
-void transpose(double *A, int n, int m, double *At){
-    for(int i=0;i<n;i++) for(int j=0;j<m;j++)
-        At[j*n + i] = A[i*m + j];
-}
-
-// C) Symmetry check for square matrix A (n×n)
-int is_symmetric(double *A, int n){
-    for(int i=0;i<n;i++) for(int j=i+1;j<n;j++)
-        if(fabs(A[i*n+j] - A[j*n+i]) > EPS) return 0;
-    return 1;
-}
-
-// D) Compare two matrices of size n×n
-int is_equal(double *A, double *B, int n){
-    for(int i=0;i<n*n;i++)
-        if(fabs(A[i] - B[i]) > EPS) return 0;
-    return 1;
-}
-
-// E) Gaussian elimination rank estimation
-int matrix_rank(double *M, int n, int m){
-    int rank = 0;
-    double *A = malloc(n*m*sizeof(double));
-    memcpy(A, M, n*m*sizeof(double));
-    for(int c=0, r=0; c<m && r<n; c++){
-        // find pivot row
-        int piv = r;
-        for(int i=r+1;i<n;i++)
-            if(fabs(A[i*m+c]) > fabs(A[piv*m+c])) piv=i;
-        if(fabs(A[piv*m+c]) < EPS) continue;
-        // swap
-        if(piv != r){
-            for(int j=c;j<m;j++){
-                double tmp = A[piv*m+j];
-                A[piv*m+j] = A[r*m+j];
-                A[r*m+j] = tmp;
-            }
-        }
-        // eliminate below
-        for(int i=r+1;i<n;i++){
-            double f = A[i*m+c]/A[r*m+c];
-            for(int j=c;j<m;j++)
-                A[i*m+j] -= f * A[r*m+j];
-        }
-        r++; rank++;
-    }
-    free(A);
-    return rank;
-}
-
-// F) Power method to estimate dominant eigenvalue of symmetric square A (n×n)
-double power_eigen(double *A, int n){
-    double *x = calloc(n, sizeof(double)), *y = calloc(n,sizeof(double));
-    for(int i=0;i<n;i++) x[i]=1.0; // initial guess
-    double lambda=0, lambda_old;
-    do {
-        for(int i=0;i<n;i++){
-            y[i]=0.0;
-            for(int j=0;j<n;j++) y[i]+=A[i*n+j] * x[j];
-        }
-        // normalize y to get new x
-        lambda_old = lambda;
-        lambda = fabs(y[0]);
-        for(int i=1;i<n;i++) if(fabs(y[i])>lambda) lambda=fabs(y[i]);
-        for(int i=0;i<n;i++) x[i] = y[i]/lambda;
-    } while(fabs(lambda - lambda_old) > EPS);
-    free(x); free(y);
-    return lambda;
-}
-
-int main(){
-    int n=3, m=2;  // example
-    double Q[6] = {1,2,3, 4,5,6};  // 3×2
-
-    double Qt[6]; transpose(Q,n,m,Qt);
-    double QQt[9]; matmul(Q,n,m,Qt,n,QQt);
-
-    double QQt2[9]; matmul(QQt,n,n,QQt,n,QQt2);
-
-    double QQtQ[6]; matmul(QQt,n,n,Q,m,QQtQ);
-
-    // 1. Symmetry
-    printf("QQ^T symmetric? %s\n", is_symmetric(QQt,n)?"Yes":"No");
-    printf("(QQ^T)Q symmetric? %s\n", (n==m && is_symmetric(QQtQ,n))?"Yes":"Likely No");
-
-    // 2. Idempotence of QQ^T
-    printf("Idempotent? (QQ^T)^2 = QQ^T? %s\n", is_equal(QQt, QQt2, n)?"Yes":"No");
-
-    // 3. Rank
-    printf("rank(QQ^T Q) = %d, rank(Q) = %d\n", matrix_rank(QQtQ,n,m), matrix_rank(Q,n,m));
-
-    // 4. Positive eigenvalue check (dominant only)
-    double e = power_eigen(QQtQ, n);
-    printf("Dominant eigenvalue of (QQ^T)Q ≈ %.6f (>=0)? %s\n", e, e>=-EPS?"Yes":"No");
-
-    return 0;
-}
-*/
