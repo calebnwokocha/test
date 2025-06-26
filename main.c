@@ -128,54 +128,58 @@ static void strassen_mul(double *A, int n, int k,
 }
 
 int main() {
-    int n, m;
-    printf("Enter n (rows of Q) and m (columns of Q), separated by space: ");
-    if (scanf("%d %d", &n, &m) != 2) {
-        fprintf(stderr, "Invalid input for n and m.\n");
-        return EXIT_FAILURE;
-    }
-
-    double *Q = malloc((size_t)n * m * sizeof(double)); // Query
-    double *K = calloc((size_t)n * n, sizeof(double)); // Key
-    double *V = calloc((size_t)n * m, sizeof(double)); // Value
-    int *A = malloc((size_t)n * m * sizeof(int)); // Assignment
-    if (!Q || !K || !V || !A) { perror("malloc"); return EXIT_FAILURE; }
-
-    printf("Enter the %d x %d entries of Q, row by row:\n", n, m);
-    for (int i = 0; i < n*m; i++) {
-        if (scanf("%lf", &Q[i]) != 1) {
-            fprintf(stderr, "Invalid matrix entry.\n");
+    while (1) {
+        int n, m;
+        printf("Enter n (rows of Q) and m (columns of Q), separated by space: ");
+        fflush(stdout);
+        if (scanf("%d %d", &n, &m) != 2) {
+            fprintf(stderr, "Invalid input for n and m.\n");
             return EXIT_FAILURE;
         }
-    }
 
-    // Compute K = Q × Q^T. The transpose of Q is Q^T
-    strassen_mul(Q, n, m, Q, m, n, K);
+        double *Q = malloc((size_t)n * m * sizeof(double));
+        double *K = calloc((size_t)n * n, sizeof(double));
+        double *V = calloc((size_t)n * m, sizeof(double));
+        int *A = malloc((size_t)n * m * sizeof(int));
+        if (!Q || !K || !V || !A) { perror("malloc"); return EXIT_FAILURE; }
 
-    // Compute V = K × Q
-    strassen_mul(K, n, n, Q, m, m, V);
+        printf("Enter the %d x %d entries of Q, row by row:\n", n, m);
+        for (int i = 0; i < n*m; i++) {
+            if (scanf("%lf", &Q[i]) != 1) {
+                fprintf(stderr, "Invalid matrix entry.\n");
+                return EXIT_FAILURE;
+            }
+        }
 
-    printf("Q^T is transpose of Q. Result of V = (Q x Q^T) x Q:\n");
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < m; j++)
-            printf("%.6g%s", V[i*m + j], j+1<m ? " " : "");
+        // Compute K = Q x Q^T
+        strassen_mul(Q, n, m, Q, m, n, K);
+
+        // Compute V = K x Q
+        strassen_mul(K, n, n, Q, m, m, V);
+
+        printf("Q^T is transpose of Q. Result of V = (Q x Q^T) x Q:\n");
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < m; j++)
+                printf("%.6g%s", V[i*m + j], j+1<m ? " " : "");
+            printf("\n");
+        }
+
+        // Compute A based on V: A[i] = 1 if V[i] > 0, else 0
+        #pragma omp parallel for schedule(static)
+        for (int i = 0; i < n * m; i++) {
+            A[i] = (V[i] > 0.0) ? 1 : 0;
+        }
+
+        printf("Matrix A (1 if corresponding V > 0, else 0):\n");
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < m; j++)
+                printf("%d%s", A[i*m + j], j+1<m ? " " : "");
+            printf("\n");
+        }
+
+        free(Q); free(K); free(V); free(A);
         printf("\n");
     }
-
-    // Compute A based on V: A[i] = 1 if V[i] > 0, else 0
-    #pragma omp parallel for schedule(static)
-    for (int i = 0; i < n * m; i++) {
-        A[i] = (V[i] > 0.0) ? 1 : 0;
-    }
-
-    printf("Matrix A (1 if corresponding V > 0, else 0):\n");
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < m; j++)
-            printf("%d%s", A[i*m + j], j+1<m ? " " : "");
-        printf("\n");
-    }
-
-    free(Q); free(K); free(V); free(A);
     return 0;
 }
 
