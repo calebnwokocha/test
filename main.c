@@ -8,90 +8,129 @@ typedef struct {
     int sz;
 } Clause;
 
-int cmp_int(const void *a, const void *b) {
-    return (*(int*)a) - (*(int*)b);
+int cmp_abs(const void *a, const void *b) {
+    int x = abs(*(int*)a), y = abs(*(int*)b);
+    return (x > y) - (x < y);
 }
 
-// a) Read clauses and determine n, m, and sz
-Clause* read_clauses(int *n, int *m) {
-    int max_var = 0;
-    int max_clause_size = 0;
-    Clause *C = malloc(sizeof(*C));
-    *m = 0;
+Clause* read_clauses(int **vars_out, int *n_out, int *m_out) {
+    Clause *C = NULL;
+    int M = 0, cap = 0, max_var = 0;
+    int *var_seen = calloc(1024, sizeof(int)); // dynamic tracking
 
-    printf("Enter clauses (press Enter on an empty line to finish):\n");
-    while (true) {
-        C[*m].lit = malloc(10 * sizeof(int)); // initial allocation
-        printf("Clause %d: enter literals (space-separated):\n", *m + 1);
-
+    printf("Enter clauses (blank line to finish):\n");
+    while (1) {
         char line[1024];
-        if (!fgets(line, sizeof(line), stdin) || line[0] == '\n') {
-            break; // end input on empty line
+        if (!fgets(line, sizeof(line), stdin) || line[0]=='\n') break;
+
+        if (M+1 > cap) {
+            cap = cap ? cap*2 : 4;
+            C = realloc(C, cap * sizeof *C);
         }
 
-        int sz = 0;
-        char *token = strtok(line, " \n");
-        while (token) {
-            C[*m].lit[sz++] = atoi(token);
-            if (abs(C[*m].lit[sz - 1]) > max_var) {
-                max_var = abs(C[*m].lit[sz - 1]);
-            }
-            token = strtok(NULL, " \n");
+        Clause *c = &C[M];
+        c->lit = malloc(8 * sizeof(int));
+        c->sz = 0;
+        char *tok = strtok(line, " \t\n");
+        while (tok) {
+            int lit = atoi(tok);
+            if (c->sz % 8 == 7) // expand every 8
+                c->lit = realloc(c->lit, (c->sz+8)*sizeof(int));
+            c->lit[c->sz++] = lit;
+
+            int av = abs(lit);
+            if (av > max_var) max_var = av;
+            if (av >= 0 && av < 1024) var_seen[av] = 1;
+
+            tok = strtok(NULL, " \t\n");
         }
-        C[*m].sz = sz;
-        if (sz > max_clause_size) {
-            max_clause_size = sz;
-        }
-        (*m)++;
-        C = realloc(C, (*m + 1) * sizeof(*C)); // reallocate for next clause
+        M++;
     }
 
-    *n = max_var;
-    printf("Detected n = %d variables, m = %d clauses, max clause size = %d\n", *n, *m, max_clause_size);
+    // build distinct variable list
+    int total = 0;
+    for (int v = 1; v <= max_var; v++)
+        if (v < 1024 && var_seen[v]) total++;
+    int *vars = malloc(total * sizeof(int));
+    for (int v = 1, i = 0; v <= max_var; v++)
+        if (v < 1024 && var_seen[v]) vars[i++] = v;
+    free(var_seen);
+
+    *vars_out = vars;
+    *n_out = total;
+    *m_out = M;
     return C;
 }
 
-// b) Ensure all variables appear (positively if missing)
-void pad_clause(Clause *c, int n) {
-    bool present[n + 1];
-    for (int v = 1; v <= n; v++) present[v] = false;
+void pad_clause(Clause *c, int n, int *vars) {
+    bool seen[n];
+    memset(seen, 0, n);
     for (int i = 0; i < c->sz; i++)
-        present[abs(c->lit[i])] = true;
-    for (int v = 1; v <= n; v++)
-        if (!present[v])
-            c->lit[c->sz++] = v;
+        for (int j = 0; j < n; j++)
+            if (abs(c->lit[i]) == vars[j]) seen[j] = true;
+
+    for (int j = 0; j < n; j++) {
+        if (!seen[j]) {
+            c->lit[c->sz++] = vars[j];
+        }
+    }
 }
 
-// c) Sort literals
-void sort_clause(Clause *c) {
-    qsort(c->lit, c->sz, sizeof(int), cmp_int);
-}
-
-// d) Build forbidden vector
-bool* build_forbidden(Clause *c, int n) {
-    bool *a = calloc(n + 1, sizeof(bool));
-    for (int j = 0; j < c->sz; j++) {
-        int lit = c->lit[j];
-        a[abs(lit)] = (lit < 0);
+bool* build_forbidden(Clause *c, int n, int *vars) {
+    bool *a = calloc(n+1, sizeof(bool));
+    for (int i = 0; i < c->sz; i++) {
+        int lit = c->lit[i];
+        for (int j = 0; j < n; j++) {
+            if (abs(lit) == vars[j]) {
+                a[j+1] = (lit < 0);
+                break;
+            }
+        }
     }
     return a;
 }
 
+// After reading and before padding/sorting, do:
+bool check_unsat_clause(int *lits, int sz) {
+    // Build a small hash or boolean array indexed by the actual literal values
+    // For simplicity, use dynamic range based on max absolute.
+    for (int i = 0; i < sz; i++) {
+        for (int j = i + 1; j < sz; j++) {
+            if (lits[i] + lits[j] == 0) return true; // found x and -x
+        }
+    }
+    return false;
+}
+
 int main(void) {
-    int n, m;
-    Clause *C = read_clauses(&n, &m);
+    int *vars, n, m;
+    Clause *C = read_clauses(&vars, &n, &m);
+    printf("Detected %d distinct variables, %d clauses\n", n, m);
 
     bool **forbidden = malloc(m * sizeof(bool*));
     for (int i = 0; i < m; i++) {
-        pad_clause(&C[i], n);
-        sort_clause(&C[i]);
-        forbidden[i] = build_forbidden(&C[i], n);
+        if (check_unsat_clause(C[i].lit, C[i].sz)) {
+            printf("UNSAT (clause %d contains a variable and its negation)\n", i + 1);
+            return 0; // terminate early
+        }
+        pad_clause(&C[i], n, vars);
+        qsort(C[i].lit, C[i].sz, sizeof(int), cmp_abs);
+        forbidden[i] = build_forbidden(&C[i], n, vars);
     }
 
     for (int i = 0; i < m; i++) {
+        // Print the padded and sorted clause
+        printf("Clause %d padded and sorted literals:", i + 1);
+        for (int j = 0; j < C[i].sz; j++) {
+            printf(" %d", C[i].lit[j]);
+        }
+        printf("\n");
+
+        // Print the forbidden assignment vector
         printf("Clause %d forbidden a[1..%d]:", i + 1, n);
-        for (int v = 1; v <= n; v++)
-            printf(" %d", forbidden[i][v]);
+        for (int j = 1; j <= n; j++) {
+            printf(" %d", forbidden[i][j]);
+        }
         printf("\n");
     }
 
@@ -99,7 +138,8 @@ int main(void) {
         free(C[i].lit);
         free(forbidden[i]);
     }
-    free(C);
     free(forbidden);
+    free(C);
+    free(vars);
     return 0;
 }
