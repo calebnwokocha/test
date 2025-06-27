@@ -2,144 +2,169 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <omp.h>
 
 typedef struct {
-    int *lit;
-    int sz;
+    int *orig;   // original literals
+    int  sz;     // number of original literals
 } Clause;
 
-int cmp_abs(const void *a, const void *b) {
-    int x = abs(*(int*)a), y = abs(*(int*)b);
-    return (x > y) - (x < y);
-}
-
-Clause* read_clauses(int **vars_out, int *n_out, int *m_out) {
+// Phase 1: read clauses, skip any lit == 0
+static Clause* read_clauses(int *out_M, int *out_max_id, bool **out_seen) {
     Clause *C = NULL;
-    int M = 0, cap = 0, max_var = 0;
-    int *var_seen = calloc(1024, sizeof(int)); // dynamic tracking
+    int cap = 0, M = 0, max_id = 0;
+    bool *seen = calloc(1024, sizeof(bool));
+    char line[2048];
 
     printf("Enter clauses (blank line to finish):\n");
-    while (1) {
-        char line[1024];
-        if (!fgets(line, sizeof(line), stdin) || line[0]=='\n') break;
-
-        if (M+1 > cap) {
-            cap = cap ? cap*2 : 4;
-            C = realloc(C, cap * sizeof *C);
+    while (fgets(line, sizeof(line), stdin) && *line != '\n') {
+        if (M == cap) {
+            cap = cap ? cap * 2 : 4;
+            C   = realloc(C, cap * sizeof(Clause));
         }
-
-        Clause *c = &C[M];
-        c->lit = malloc(8 * sizeof(int));
-        c->sz = 0;
-        char *tok = strtok(line, " \t\n");
-        while (tok) {
+        // parse into a temporary vector
+        int *temp = NULL, tcap = 0, tsz = 0;
+        for (char *tok = strtok(line, " \t\n"); tok; tok = strtok(NULL, " \t\n")) {
             int lit = atoi(tok);
-            if (c->sz % 8 == 7) // expand every 8
-                c->lit = realloc(c->lit, (c->sz+8)*sizeof(int));
-            c->lit[c->sz++] = lit;
-
-            int av = abs(lit);
-            if (av > max_var) max_var = av;
-            if (av >= 0 && av < 1024) var_seen[av] = 1;
-
-            tok = strtok(NULL, " \t\n");
+            if (lit == 0) continue;        // ← skip zeros entirely
+            if (tsz == tcap) {
+                tcap = tcap ? tcap*2 : 4;
+                temp = realloc(temp, tcap * sizeof(int));
+            }
+            temp[tsz++] = lit;
+            int v = abs(lit);
+            if (v > max_id) max_id = v;
+            if (v < 1024)  seen[v] = true;
         }
+        C[M].orig = temp;
+        C[M].sz   = tsz;
         M++;
     }
 
-    // build distinct variable list
-    int total = 0;
-    for (int v = 1; v <= max_var; v++)
-        if (v < 1024 && var_seen[v]) total++;
-    int *vars = malloc(total * sizeof(int));
-    for (int v = 1, i = 0; v <= max_var; v++)
-        if (v < 1024 && var_seen[v]) vars[i++] = v;
-    free(var_seen);
-
-    *vars_out = vars;
-    *n_out = total;
-    *m_out = M;
+    *out_M      = M;
+    *out_max_id = max_id;
+    *out_seen   = seen;
     return C;
 }
 
-void pad_clause(Clause *c, int n, int *vars) {
-    bool seen[n];
-    memset(seen, 0, n);
-    for (int i = 0; i < c->sz; i++)
-        for (int j = 0; j < n; j++)
-            if (abs(c->lit[i]) == vars[j]) seen[j] = true;
-
-    for (int j = 0; j < n; j++) {
-        if (!seen[j]) {
-            c->lit[c->sz++] = vars[j];
-        }
-    }
+// Phase 2: build sorted list of distinct vars
+static int* build_vars(bool *seen, int max_id, int *out_n) {
+    int n = 0;
+    for (int v = 1; v <= max_id; v++)
+        if (v < 1024 && seen[v]) n++;
+    int *vars = malloc(n * sizeof(int));
+    for (int v = 1, i = 0; v <= max_id; v++)
+        if (v < 1024 && seen[v]) vars[i++] = v;
+    *out_n = n;
+    return vars;
 }
 
-bool* build_forbidden(Clause *c, int n, int *vars) {
-    bool *a = calloc(n+1, sizeof(bool));
+// Phase 3: scan, pad+“sort”, build forbidden in one pass
+static void process_clause(const Clause *c,
+                           int *vars, int *var_to_idx, int n,
+                           int *out_sorted, bool *out_forbid,
+                           bool *early_unsat_flag, int clause_idx)
+{
+    bool seen_pos[n], seen_neg[n];
+    memset(seen_pos, 0, n * sizeof(bool));
+    memset(seen_neg, 0, n * sizeof(bool));
+
+    // detect p vs. ¬p
     for (int i = 0; i < c->sz; i++) {
-        int lit = c->lit[i];
-        for (int j = 0; j < n; j++) {
-            if (abs(lit) == vars[j]) {
-                a[j+1] = (lit < 0);
-                break;
+        int lit = c->orig[i];
+        int v   = abs(lit);
+        int idx = var_to_idx[v];
+        if (lit > 0) {
+            if (seen_neg[idx]) {
+                #pragma omp critical
+                {
+                    printf("UNSAT (clause %d contains both %d and -%d)\n\n",
+                           clause_idx+1, v, v);
+                    *early_unsat_flag = true;
+                }
+                return;
             }
+            seen_pos[idx] = true;
+        } else {
+            if (seen_pos[idx]) {
+                #pragma omp critical
+                {
+                    printf("UNSAT (clause %d contains both %d and -%d)\n\n",
+                           clause_idx+1, v, v);
+                    *early_unsat_flag = true;
+                }
+                return;
+            }
+            seen_neg[idx] = true;
         }
     }
-    return a;
+
+    // build padded+sorted & forbidden
+    for (int j = 0; j < n; j++) {
+        if (seen_neg[j]) {
+            out_sorted[j]  = -vars[j];
+            out_forbid[j]  = true;
+        } else {
+            // either seen_pos[j] or padded positive
+            out_sorted[j]  =  vars[j];
+            out_forbid[j]  = false;
+        }
+    }
 }
 
-// After reading and before padding/sorting, do:
-bool check_unsat_clause(int *lits, int sz) {
-    // Build a small hash or boolean array indexed by the actual literal values
-    // For simplicity, use dynamic range based on max absolute.
-    for (int i = 0; i < sz; i++) {
-        for (int j = i + 1; j < sz; j++) {
-            if (lits[i] + lits[j] == 0) return true; // found x and -x
-        }
-    }
-    return false;
+// Phase 4: print one clause
+static void print_clause(const int *sorted, const bool *forbid, int n, int idx) {
+    printf("Clause %d (padded and sorted):", idx+1);
+    for (int j = 0; j < n; j++)
+        printf(" %d", sorted[j]);
+    printf("\nClause %d forbidden a[1..%d]:", idx+1, n);
+    for (int j = 0; j < n; j++)
+        printf(" %d", forbid[j] ? 1 : 0);
+    printf("\n\n");
 }
 
 int main(void) {
-    int *vars, n, m;
-    Clause *C = read_clauses(&vars, &n, &m);
-    printf("Detected %d distinct variables, %d clauses\n", n, m);
+    while (1) {
+        int M, max_id, n;
+        bool *seen;
+        Clause *C = read_clauses(&M, &max_id, &seen);
 
-    bool **forbidden = malloc(m * sizeof(bool*));
-    for (int i = 0; i < m; i++) {
-        if (check_unsat_clause(C[i].lit, C[i].sz)) {
-            printf("UNSAT (clause %d contains a variable and its negation)\n", i + 1);
-            return 0; // terminate early
+        int *vars       = build_vars(seen, max_id, &n);
+        int *var_to_idx = calloc(max_id+1, sizeof(int));
+        for (int i = 0; i < n; i++)
+            var_to_idx[vars[i]] = i;
+
+        printf("Detected %d distinct variable(s) and %d clause(s)\n\n", n, M);
+
+        // pre-allocate shared scratch
+        int  (*sorted)[n] = malloc(M * sizeof *sorted);
+        bool (*forbid)[n] = malloc(M * sizeof *forbid);
+        bool early_unsat = false;
+
+        #pragma omp parallel for schedule(dynamic)
+        for (int i = 0; i < M; i++) {
+            if (!early_unsat) {
+                process_clause(&C[i],
+                               vars, var_to_idx, n,
+                               sorted[i], forbid[i],
+                               &early_unsat, i);
+            }
         }
-        pad_clause(&C[i], n, vars);
-        qsort(C[i].lit, C[i].sz, sizeof(int), cmp_abs);
-        forbidden[i] = build_forbidden(&C[i], n, vars);
-    }
 
-    for (int i = 0; i < m; i++) {
-        // Print the padded and sorted clause
-        printf("Clause %d padded and sorted literals:", i + 1);
-        for (int j = 0; j < C[i].sz; j++) {
-            printf(" %d", C[i].lit[j]);
+        if (!early_unsat) {
+            for (int i = 0; i < M; i++)
+                print_clause(sorted[i], forbid[i], n, i);
         }
-        printf("\n");
 
-        // Print the forbidden assignment vector
-        printf("Clause %d forbidden a[1..%d]:", i + 1, n);
-        for (int j = 1; j <= n; j++) {
-            printf(" %d", forbidden[i][j]);
-        }
-        printf("\n");
+        // cleanup
+        for (int i = 0; i < M; i++)
+            free(C[i].orig);
+        free(C);
+        free(seen);
+        free(vars);
+        free(var_to_idx);
+        free(sorted);
+        free(forbid);
     }
-
-    for (int i = 0; i < m; i++) {
-        free(C[i].lit);
-        free(forbidden[i]);
-    }
-    free(forbidden);
-    free(C);
-    free(vars);
     return 0;
 }
