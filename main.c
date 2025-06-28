@@ -2,18 +2,17 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <stdint.h>
+#include <inttypes.h>
 #include <omp.h>
-#include <time.h>
 
-/*// Portable print for size_t: assumes C99+ or casts to unsigned long if needed.
-#define FMT_ZU "%zu"*/
-
+/* Clause structure */
 typedef struct {
     int *orig;   // original literals
     int  sz;     // number of original literals
 } Clause;
 
-// Phase 1: read clauses, skip any lit == 0
+/* Read clauses from stdin, skip lit == 0 */
 static Clause* read_clauses(int *out_M, int *out_max_id, bool **out_seen) {
     Clause *C = NULL;
     int cap = 0, M = 0, max_id = 0;
@@ -26,13 +25,12 @@ static Clause* read_clauses(int *out_M, int *out_max_id, bool **out_seen) {
             cap = cap ? cap * 2 : 4;
             C   = realloc(C, cap * sizeof(Clause));
         }
-        // parse into a temporary vector
         int *temp = NULL, tcap = 0, tsz = 0;
         for (char *tok = strtok(line, " \t\n"); tok; tok = strtok(NULL, " \t\n")) {
             int lit = atoi(tok);
-            if (lit == 0) continue;        // ← skip zeros entirely
+            if (lit == 0) continue;
             if (tsz == tcap) {
-                tcap = tcap ? tcap*2 : 4;
+                tcap = tcap ? tcap * 2 : 4;
                 temp = realloc(temp, tcap * sizeof(int));
             }
             temp[tsz++] = lit;
@@ -51,7 +49,7 @@ static Clause* read_clauses(int *out_M, int *out_max_id, bool **out_seen) {
     return C;
 }
 
-// Phase 2: build sorted list of distinct vars
+/* Build sorted list of distinct vars */
 static int* build_vars(bool *seen, int max_id, int *out_n) {
     int n = 0;
     for (int v = 1; v <= max_id; v++)
@@ -63,17 +61,16 @@ static int* build_vars(bool *seen, int max_id, int *out_n) {
     return vars;
 }
 
-// Phase 3: scan, pad+“sort”, build forbidden in one pass
+/* Process a clause: pad, sort, build forbidden vector */
 static void process_clause(const Clause *c,
                            int *vars, int *var_to_idx, int n,
-                           int *out_sorted, unsigned char *out_forbid_Q,
+                           int *out_sorted, unsigned char *out_forbidden,
                            bool *early_unsat_flag, int clause_idx)
 {
     bool seen_pos[n], seen_neg[n];
     memset(seen_pos, 0, n * sizeof(bool));
     memset(seen_neg, 0, n * sizeof(bool));
 
-    // detect p vs. ¬p
     for (int i = 0; i < c->sz; i++) {
         int lit = c->orig[i];
         int v   = abs(lit);
@@ -103,137 +100,75 @@ static void process_clause(const Clause *c,
         }
     }
 
-    // build padded+sorted & forbidden
     for (int j = 0; j < n; j++) {
         if (seen_neg[j]) {
-            out_sorted[j]  = -vars[j];
-            out_forbid_Q[clause_idx * n + j] = 1;  // Store forbidden vector here
+            out_sorted[j]             = -vars[j];
+            out_forbidden[clause_idx*n + j] = 1;
         } else {
-            // either seen_pos[j] or padded positive
-            out_sorted[j]  =  vars[j];
-            out_forbid_Q[clause_idx * n + j] = 0;
+            out_sorted[j]             =  vars[j];
+            out_forbidden[clause_idx*n + j] = 0;
         }
     }
 }
 
-// Phase 4: print one clause
-static void print_clause(const int *sorted, const unsigned char *forbid_Q, int n, int idx) {
+/* Print padded clause and its forbidden vector */
+static void print_clause(const int *sorted, const unsigned char *forbidden, int n, int idx) {
     printf("Clause %d (padded and sorted):", idx+1);
-    for (int j = 0; j < n; j++)
-        printf(" %d", sorted[j]);
+    for (int j = 0; j < n; j++) printf(" %d", sorted[j]);
     printf("\nClause %d forbidden a[1..%d]:", idx+1, n);
-    for (int j = 0; j < n; j++)
-        printf(" %d", forbid_Q[idx * n + j]);
+    for (int j = 0; j < n; j++) printf(" %d", forbidden[idx*n + j]);
     printf("\n\n");
 }
 
-/*// Computes minimal period via KMP failure function (linear time).
-static size_t minimal_period(const unsigned char *s, size_t m) {
-    size_t *pi = malloc(m * sizeof *pi), k = 0;
-    if (!pi) { perror("malloc"); exit(EXIT_FAILURE); }
-    pi[0] = 0;
-    for (size_t i = 1; i < m; i++) {
-        while (k > 0 && s[k] != s[i]) k = pi[k - 1];
-        if (s[k] == s[i]) k++;
-        pi[i] = k;
+/* Print binary representation */
+static inline void print_binary(uint32_t v, size_t cols) {
+    for (size_t b = 0; b < cols; ++b) {
+        putchar((v >> (cols - 1 - b)) & 1 ? '1' : '0');
+        if (b + 1 < cols) putchar(' ');
     }
-    size_t p = m - pi[m - 1];
-    free(pi);
-    return (m % p == 0 ? p : m);
+    putchar('\n');
 }
 
-
-// Fisher–Yates shuffle in-place
-static void fisher_yates(size_t *a, size_t m) {
-    for (size_t i = m - 1; i > 0; i--) {
-        size_t j = rand() % (i + 1);
-        size_t tmp = a[i]; a[i] = a[j]; a[j] = tmp;
-    }
-}
-
-// Test: no fixed point, and each row changes at least one entry
-static bool valid_permutation(const unsigned char *Q, const size_t *o,
-                              size_t n, size_t m)
+/* Find and print first n missing binary numbers */
+void print_missing_omp(const unsigned char *arr, size_t rows, size_t cols, size_t want)
 {
-    // No fixed points
-    for (size_t j = 0; j < m; j++)
-        if (o[j] == j) return false;
+    if (cols == 0 || cols > 32) return;
+    uint32_t U = 1U << cols;
+    size_t B = (U + 63) >> 6;
+    uint64_t *present = malloc(B * sizeof *present);
+    if (!present) { perror("malloc"); return; }
+    memset(present, 0, B * sizeof *present);
 
-    // Each row changed somewhere
-    for (size_t i = 0; i < n; i++) {
-        const unsigned char *Qi = Q + i * m;
-        bool changed = false;
-        for (size_t j = 0; j < m; j++)
-            if (Qi[j] != Qi[o[j]]) {
-                changed = true;
-                break;
-            }
-        if (!changed) return false;
+    #pragma omp parallel
+    {
+        uint64_t *local = malloc(B * sizeof *local);
+        if (!local) abort();
+        memset(local, 0, B * sizeof *local);
+
+        #pragma omp for nowait schedule(static)
+        for (size_t i = 0; i < rows; ++i) {
+            uint32_t v = 0;
+            for (size_t j = 0; j < cols; ++j)
+                v = (v << 1) | (arr[i*cols + j] & 1);
+            local[v >> 6] |= 1ULL << (v & 63);
+        }
+
+        #pragma omp critical
+        for (size_t k = 0; k < B; ++k)
+            present[k] |= local[k];
+
+        free(local);
     }
-    return true;
-}
 
-// Build a derangement σ ; expected few retries until success
-static bool build_safe_derangement(size_t *o,
-                                   const unsigned char *Q,
-                                   size_t n, size_t m)
-{
-    srand((unsigned)time(NULL));
-    // Initialize to identity permutation
-    for (size_t j = 0; j < m; j++)
-        o[j] = j;
-
-    // Retry until valid permutation found
-    const int maxRetries = 10;
-    for (int attempt = 0; attempt < maxRetries; attempt++) {
-        fisher_yates(o, m);
-        if (valid_permutation(Q, o, n, m))
-            return true;
-    }
-    return false;
-}
-
-// Computes V = Q ★ σ (deranged) with full safety checks.
-bool compute_V_safe(const unsigned char *Q, unsigned char *V,
-                    size_t n, size_t m, size_t t) {
-    if (m < 2) {
-        fputs("Error: need m ≥ 2\n", stderr);
-        return false;
-    }
-    // Pre-scan: check periods
-    for (size_t i = 0; i < n; i++) {
-        size_t p = minimal_period(Q + i * m, m);
-        if (p == 1) {
-            fprintf(stderr, "Warning: constant row at " FMT_ZU ", will force change\n", i);
+    size_t printed = 0;
+    for (uint32_t v = 0; v < U && printed < want; ++v) {
+        if ((present[v >> 6] & (1ULL << (v & 63))) == 0) {
+            print_binary(v, cols);
+            ++printed;
         }
     }
-    // Build derangement
-    size_t *sigma = malloc(m * sizeof *sigma);
-    if (!sigma) { perror("malloc"); return false; }
-    if (!build_safe_derangement(sigma, Q, n, m)) {
-        fputs("Error: cannot build derangement that changes all rows\n", stderr);
-        free(sigma);
-        return false;
-    }
-    // Compute V
-    for (size_t i = 0; i < n; i++) {
-        const unsigned char *Qi = Q + i * m;
-        unsigned char *Vi = V + i * t;
-        for (size_t j = 0; j < t; j++)
-            Vi[j] = Qi[sigma[j % m]];
-    }
-    free(sigma);
-    return true;
-}*/
-
-// Function to print a 2D array
-void print_2d_array(unsigned char *array, size_t rows, size_t cols) {
-    for (size_t i = 0; i < rows; i++) {
-        for (size_t j = 0; j < cols; j++) {
-            printf("%d ", array[i * cols + j]);
-        }
-        printf("\n");
-    }
+    printf("\n");
+    free(present);
 }
 
 int main(void) {
@@ -242,54 +177,35 @@ int main(void) {
         bool *seen;
         Clause *C = read_clauses(&M, &max_id, &seen);
 
-        int *vars       = build_vars(seen, max_id, &n);
-        int *var_to_idx = calloc(max_id+1, sizeof(int));
-        for (int i = 0; i < n; i++)
-            var_to_idx[vars[i]] = i;
+        int *vars = build_vars(seen, max_id, &n);
+        int *var_to_idx = calloc(max_id + 1, sizeof(int));
+        for (int i = 0; i < n; i++) var_to_idx[vars[i]] = i;
 
         printf("Detected %d distinct variable(s) and %d clause(s)\n\n", n, M);
 
-        // pre-allocate shared scratch
-        int  (*sorted)[n] = malloc(M * sizeof *sorted);
-        unsigned char *forbid_Q  = malloc(M * n * sizeof(unsigned char));
+        int (*sorted)[n] = malloc(M * sizeof *sorted);
+        unsigned char *forbidden = malloc((size_t)M * n * sizeof *forbidden);
         bool early_unsat = false;
 
         #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < M; i++) {
-            if (!early_unsat) {
-                process_clause(&C[i],
-                               vars, var_to_idx, n,
-                               sorted[i], forbid_Q,
-                               &early_unsat, i);
-            }
+            if (!early_unsat)
+                process_clause(&C[i], vars, var_to_idx, n,
+                               sorted[i], forbidden, &early_unsat, i);
         }
 
         if (!early_unsat) {
-            for (int i = 0; i < M; i++)
-                print_clause(sorted[i], forbid_Q, n, i);
+            for (int i = 0; i < M; i++) print_clause(sorted[i], forbidden, n, i);
+
+            size_t total = 1U << n;
+            size_t want = total > (size_t)M ? total - (size_t)M : 0;
+            printf("First %lu missing assignments (out of %lu possible):\n", (unsigned long)want, (unsigned long)total);
+            print_missing_omp(forbidden, M, n, want);
         }
 
-/*        // Compute V using compute_V_safe
-        size_t t = n; // Assuming t equals n for this example
-        unsigned char *V = malloc(M * t * sizeof(unsigned char));
-        if (compute_V_safe(forbid_Q, V, M, n, t)) {
-            printf("Matrix V (resulting matrix):\n");
-            print_2d_array(V, M, t);
-        } else {
-            printf("Failed to compute matrix V.\n");
-        }
-*/
-
-        // cleanup
-        for (int i = 0; i < M; i++)
-            free(C[i].orig);
-        free(C);
-        free(seen);
-        free(vars);
-        free(var_to_idx);
-        free(sorted);
-        free(forbid_Q);
-        //free(V);
+        for (int i = 0; i < M; i++) free(C[i].orig);
+        free(C); free(seen); free(vars); free(var_to_idx);
+        free(sorted); free(forbidden);
     }
     return 0;
 }
