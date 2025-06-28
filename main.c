@@ -6,7 +6,6 @@
 #include <inttypes.h>
 #include <omp.h>
 
-
 typedef struct {
     int *orig;   // original literals
     int  sz;     // number of original literals
@@ -126,137 +125,207 @@ static void print_clause(const int *sorted, const unsigned char *forbidden, int 
     printf("\n\n");
 }
 
-// Convert row into limbs
-static void row_to_limbs(const unsigned char *row, uint64_t *limb, int C, int LIMBS) {
-    memset(limb, 0, LIMBS * sizeof *limb);
+// Multiply decimal‐string `s` by 2 in place.
+//   s is e.g. "12345" → becomes "24690"
+static void dec_mul2(char *s) {
+    int carry = 0;
+    for (char *p = s; *p; p++) {
+        int d = (*p - '0')*2 + carry;
+        *p  = '0' + (d % 10);
+        carry = d / 10;
+    }
+    if (carry) {                          // overflow a digit
+        size_t len = strlen(s);
+        memmove(s+1, s, len+1);
+        s[0] = '0' + carry;
+    }
+}
+
+// Add a single bit 0 or 1 to decimal‐string `s`
+//   s is "24690", bit=1 → becomes "24691"
+static void dec_add1(char *s, int bit) {
+    int carry = bit;
+    for (char *p = s + strlen(s) - 1; p >= s && carry; p--) {
+        int d = (*p - '0') + carry;
+        *p  = '0' + (d % 10);
+        carry = d / 10;
+    }
+    if (carry) {
+        size_t len = strlen(s);
+        memmove(s+1, s, len+1);
+        s[0] = '0' + carry;
+    }
+}
+
+// Convert a C‑bit binary row[0..C-1] into a decimal string.
+// Returns a malloc’d char* which must be free’d by caller.
+static char* binrow_to_dec(const unsigned char *row, int C) {
+    // worst‐case decimal digits ≈ C*log10(2) + 2
+    int bufsz = (int)(C * 0.30103) + 3;
+    char *s = calloc(bufsz,1);
+    strcpy(s, "0");
     for (int j = 0; j < C; j++) {
-        int limb_i = j / 64;
-        int off    = j % 64;            // pack bit 0 → LSB, bit 1 → next, ...
-        limb[limb_i] |= (uint64_t)(row[j] & 1) << off;
+        dec_mul2(s);
+        if (row[j]) dec_add1(s, 1);
     }
+    return s;
 }
 
-// Convert limbs back to row
-static void limbs_to_row(const uint64_t *limb, unsigned char *row, int C) {
-    for (int j = 0; j < C; j++) {
-        int limb_i = j / 64;
-        int off    = j % 64;
-                        //printf("no error");
-        row[j] = (limb[limb_i] >> off) & 1;
-                //printf("no error");
+// Compute dst = b − a − 1, where b > a.
+// All strings are decimal, no leading zeros (except "0").
+// Returns a malloc’d string in dst (must free).
+static char* dec_gap(const char *b, const char *a) {
+    // First compute temp = b − a
+    int lb = strlen(b), la = strlen(a);
+    int maxl = lb > la ? lb : la;
+    char *temp = calloc(maxl+2,1);
+    int borrow = 0;
+    // right‑align both
+    for (int i = 0; i < maxl; i++) {
+        int db = (i < lb ? b[lb-1-i]-'0' : 0);
+        int da = (i < la ? a[la-1-i]-'0' : 0);
+        int d  = db - da - borrow;
+        if (d < 0) { d += 10; borrow = 1; }
+        else       borrow = 0;
+        temp[maxl-1-i] = '0' + d;
     }
+    // strip leading zeros
+    char *p = temp;
+    while (*p == '0' && *(p+1)) p++;
+    memmove(temp, p, strlen(p)+1);
+
+    // now subtract 1
+    borrow = 1;
+    for (int i = strlen(temp)-1; i >= 0 && borrow; i--) {
+        int d = (temp[i]-'0') - borrow;
+        if (d < 0) { d += 10; borrow = 1; }
+        else       borrow = 0;
+        temp[i] = '0' + d;
+    }
+    // strip leading zero if any
+    p = temp;
+    while (*p == '0' && *(p+1)) p++;
+    memmove(temp, p, strlen(p)+1);
+    return temp;
 }
 
-// Lexicographic compare
-static int limbs_cmp(const void *p, const void *q, void *arg) {
-    int LIMBS = *(int *)arg;
-    const uint64_t *a = p, *b = q;
-    for (int i = LIMBS - 1; i >= 0; i--) {
-        if (a[i] < b[i]) return -1;
-        if (a[i] > b[i]) return  1;
-    }
-    return 0;
+// Compare two decimal strings a and b (no leading zeros)
+// returns −1,0,+1
+static int dec_cmp(const char *a, const char *b) {
+    int la = strlen(a), lb = strlen(b);
+    if (la < lb) return -1;
+    if (la > lb) return  1;
+    return strcmp(a,b);
 }
 
-// Increment limbs; return 1 if overflow beyond C bits
-static int limbs_inc(uint64_t *a, int LIMBS) {
-    for (int i = LIMBS - 1; i >= 0; i--) {
-        uint64_t old = a[i];
-        a[i] = old + 1;
-        if (a[i] > old) return 0;
+// Add 1 to decimal string in place:
+static void dec_incr(char *s) { dec_add1(s, 1); }
+
+// In‐place divide decimal string by 2, returning remainder 0 or 1
+static int dec_div2(char *s) {
+    int carry = 0;
+    for (char *p = s; *p; p++) {
+        int d = carry*10 + (*p - '0');
+        *p = '0' + (d / 2);
+        carry = d % 2;
     }
-    return 1;
+    // strip leading zeros
+    char *q = s;
+    while (*q == '0' && *(q+1)) q++;
+    if (q != s) memmove(s, q, strlen(q)+1);
+    return carry;
 }
 
-// Sort with context argument
-static void sort_r(void *base, size_t nmemb, size_t size,
-    int (*cmp)(const void *, const void *, void *), void *arg)
-{
-    char *a = base, *tmp = malloc(size);
-    for(size_t gap = nmemb/2; gap > 0; gap /= 2) {
-        for(size_t i = gap; i < nmemb; i++) {
-            memcpy(tmp, a + i*size, size);
-            size_t j = i;
-            while(j >= gap && cmp(a + (j-gap)*size, tmp, arg) > 0) {
-                memcpy(a + j*size, a + (j-gap)*size, size);
-                j -= gap;
-            }
-            memcpy(a + j*size, tmp, size);
-        }
+// Convert decimal string `s` into a C‑bit row[0..C-1] (array of 0/1 unsigned char).
+//   `row[0]` becomes the most‐significant bit (leftmost).
+static void dec_to_binrow(const char *s_in, unsigned char *row, int C) {
+    // make a mutable copy
+    char *s = strdup(s_in);
+    // extract bits from LSB→MSB into a temp buffer
+    unsigned char *tmp = malloc(C);
+    for (int j = C-1; j >= 0; j--) {
+        tmp[j] = dec_div2(s);
     }
+    free(s);
+    // copy into row
+    memcpy(row, tmp, C);
     free(tmp);
 }
 
-static void process(int M, int C, int LIMBS, const unsigned char *forbidden) {
-    // Pack rows
-    uint64_t *A = malloc((size_t)M * LIMBS * sizeof *A);
-    //#pragma omp parallel for
-    for (int i = 0; i < M; i++)
-        row_to_limbs(forbidden + (size_t)i * C, A + (size_t)i * LIMBS, C, LIMBS);
+// wrapper for qsort: compare two char* by numeric value
+static int dec_rows_cmp(const void *pa, const void *pb) {
+    const char *a = *(const char**)pa;
+    const char *b = *(const char**)pb;
+    return dec_cmp(a, b);
+}
 
-    // Sort
-    sort_r(A, M, LIMBS * sizeof(uint64_t), limbs_cmp, &LIMBS);
+// comparator for qsort on uint64_t
+static int uint64_cmp(const void *pa, const void *pb) {
+    uint64_t a = *(const uint64_t*)pa;
+    uint64_t b = *(const uint64_t*)pb;
+    if (a < b) return -1;
+    if (a > b) return  1;
+    return 0;
+}
 
-    // Compute offsets
-    uint64_t *offs = malloc((size_t)M * sizeof *offs);
-    uint64_t G = 0;
-    for (int i = 0; i + 1 < M; i++) {
-        uint64_t *a = A + (size_t)i * LIMBS;
-        uint64_t *b = A + (size_t)(i + 1) * LIMBS;
-        // pick the most significant limb (top 64 bits of your C‑bit vector):
-        uint64_t ai = a[LIMBS - 1];
-        uint64_t bi = b[LIMBS - 1];
-        uint64_t gap = (bi > ai) ? bi - ai - 1 : 0;
-        offs[i] = G;
-        G += gap;
-    }
-    offs[M - 1] = G;
-
-    size_t total = G * (size_t)C;
-    // Allocate output
-    unsigned char *out = malloc(total);
-    if (!out) {
-        fprintf(stderr, "ERROR: cannot allocate %" PRIu64 "*%d bytes = %zu\n",
-                G, C, total);
-        exit(1);
-    }
-
-// Generate gaps
-    //#pragma omp parallel for schedule(dynamic)    // re‑enable if thread‑safe
-    for (int i = 0; i + 1 < M; i++) {
-        uint64_t base    = offs[i];
-        size_t   offset  = base * (size_t)C;
-        uint64_t ai      = A[i * LIMBS + (LIMBS - 1)];
-        uint64_t bi      = A[(i+1) * LIMBS + (LIMBS - 1)];
-        uint64_t gap     = (bi > ai) ? bi - ai - 1 : 0;
-
-    // bounds‐check one last time if you like:
-        if (offset + gap * (size_t)C > total) {
-            fprintf(stderr, "OUT OF BOUNDS: i=%d gap=%" PRIu64 "\n", i, gap);
-            exit(1);
+static void process(int M, int C, const unsigned char *forbidden) {
+    if (C <= 64) {
+        // ───── Fast 64‑bit path ─────
+        uint64_t *vals = malloc(M * sizeof *vals);
+        for (int i = 0; i < M; i++) {
+            uint64_t v = 0;
+            for (int j = 0; j < C; j++)
+                v = (v << 1) | (forbidden[i*C + j] & 1);
+            vals[i] = v;
         }
+        qsort(vals, M, sizeof *vals, uint64_cmp);
 
-       uint64_t *cur = malloc(LIMBS * sizeof *cur);
-        memcpy(cur, A + (size_t)i * LIMBS, LIMBS * sizeof *cur);
-
-        for (uint64_t k = 0; k < gap; k++) {
-            limbs_inc(cur, LIMBS);
-            limbs_to_row(cur, out + offset * C, C);
-            offset++;
+        // enumerate gaps
+        for (int i = 0; i + 1 < M; i++) {
+            uint64_t lo = vals[i], hi = vals[i+1];
+            for (uint64_t x = lo + 1; x < hi; x++) {
+                for (int j = 0; j < C; j++)
+                    putchar(((x >> (C-1-j)) & 1) ? '1' : '0');
+                putchar('\n');
+            }
         }
+        free(vals);
 
-        free(cur);
+    } else {
+        // ── Decimal‑string path (handles any C) ──
+        // binrow_to_dec, dec_gap, dec_cmp, dec_incr, dec_to_binrow, dec_rows_cmp
+        char **dec_rows = malloc(M * sizeof(char*));
+        for (int i = 0; i < M; i++)
+            dec_rows[i] = binrow_to_dec(forbidden + i*C, C);
+
+        qsort(dec_rows, M, sizeof(char*), dec_rows_cmp);
+
+        for (int i = 0; i + 1 < M; i++) {
+            char *low  = dec_rows[i];
+            char *high = dec_rows[i+1];
+
+            // compute gap = high − low − 1
+            char *gapstr = dec_gap(high, low);
+
+            // enumerate low+1 … high−1
+            char *cur = strdup(low);
+            dec_incr(cur);
+            while (dec_cmp(cur, high) < 0) {
+                unsigned char row[C];
+                dec_to_binrow(cur, row, C);
+                for (int j = 0; j < C; j++)
+                    putchar(row[j] ? '1' : '0');
+                putchar('\n');
+                dec_incr(cur);
+            }
+
+            free(cur);
+            free(gapstr);
+        }
+        for (int i = 0; i < M; i++)
+            free(dec_rows[i]);
+        free(dec_rows);
     }
-
-    // Print
-    for (uint64_t i = 0, G0 = offs[M - 1]; i < G0; i++) {
-        for (int j = 0; j < C; j++) putchar(out[i * C + j] ? '1' : '0');
-        putchar('\n');
-    }
-
-    free(A);
-    free(offs);
-    free(out);
 }
 
 int main(void) {
@@ -292,8 +361,7 @@ int main(void) {
                 print_clause(sorted[i], forbidden, n, i);
         }
 
-        int LIMBS = (n + 63) / 64;
-        process(M, n, LIMBS, forbidden);
+        process(M, n, forbidden);
 
         // cleanup
         for (int i = 0; i < M; i++)
