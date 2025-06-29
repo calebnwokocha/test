@@ -80,7 +80,7 @@ static void process_clause(const Clause *c,
             if (seen_neg[idx]) {
                 #pragma omp critical
                 {
-                    printf("Unsatisfiable, clause %d contains both %d and -%d\n",
+                    printf("Unsatisfiable, clause (%d) contains both %d and -%d\n",
                            clause_idx+1, v, v);
                     *early_unsat_flag = true;
                 }
@@ -91,7 +91,7 @@ static void process_clause(const Clause *c,
             if (seen_pos[idx]) {
                 #pragma omp critical
                 {
-                    printf("Unsatisfiable, clause %d contains both %d and -%d\n",
+                    printf("Unsatisfiable, clause (%d) contains both %d and -%d\n",
                            clause_idx+1, v, v);
                     *early_unsat_flag = true;
                 }
@@ -125,7 +125,7 @@ static void process_clause(const Clause *c,
     printf("\n\n");
 }*/
 
-// Helper: convert a C‑bit row (row[0] is leftmost bit) to its integer value
+// Helper: convert a C bit row (row[0] is leftmost bit) to its integer value
 static uint64_t forbidden_val(const unsigned char *row, int C) {
     // skip leading zeros
     int s = 0;
@@ -145,7 +145,7 @@ static int cmp_uint64(const void *pa, const void *pb) {
     return (a < b) ? -1 : (a > b) ? +1 : 0;
 }
 
-static void process_forbidden_set(int M, int C, const unsigned char *forbidden) {
+static bool get_assignments(int M, int C, const unsigned char *forbidden) {
     // 1) build array of forbidden values
     uint64_t *vals = malloc((size_t)M * sizeof *vals);
     if (!vals) { perror("malloc"); exit(1); }
@@ -155,27 +155,55 @@ static void process_forbidden_set(int M, int C, const unsigned char *forbidden) 
 
     // 2) sort ascending
     qsort(vals, M, sizeof vals[0], cmp_uint64);
-    printf("Satisfiable assignment(s):\n");
+    bool any = false;
+
     // 3) enumerate each gap between consecutive forbidden values
     for (int i = 0; i + 1 < M; i++) {
         uint64_t ai = vals[i];
         uint64_t bi = vals[i+1];
-        // if there are values strictly between ai and bi
         if (bi > ai + 1) {
             for (uint64_t val = ai + 1; val < bi; val++) {
-                // decimal label
-                //printf("%llu: ", (unsigned long long)val);
-                // binary, MSB‑first, exactly C bits
+                any = true;
+                // print the C bit binary (with spaces)
                 for (int b = C - 1; b >= 0; b--) {
                     putchar((val >> b) & 1 ? '1' : '0');
                     if (b > 0) putchar(' ');
                 }
-                printf("\n");
+                putchar('\n');
             }
         }
     }
-    printf("\n");
+
+    // 4) now enumerate *tail* assignments > vals[M-1], up to 2^C−1
+    uint64_t last = vals[M-1];
+    uint64_t maxv = ((uint64_t)1 << C) - 1;
+    if (last < maxv) {
+        // if you need to store them:
+        int extra_count = (int)(maxv - last);
+        unsigned char *extra = malloc((size_t)extra_count * C);
+        if (!extra) { perror("malloc"); exit(1); }
+
+        for (uint64_t val = last + 1; val <= maxv; val++) {
+            any = true;
+            // print it
+            for (int b = C - 1; b >= 0; b--) {
+                putchar((val >> b) & 1 ? '1' : '0');
+                if (b > 0) putchar(' ');
+            }
+            putchar('\n');
+            // also store into extra[]
+            int row = (int)(val - last - 1);
+            for (int b = 0; b < C; b++)
+                extra[row * C + b] = (val >> (C - 1 - b)) & 1;
+        }
+
+        free(extra);
+    }
+
+    if (any)
+        printf("\n");
     free(vals);
+    return any;
 }
 
 int main(void) {
@@ -196,6 +224,8 @@ int main(void) {
         unsigned char *forbidden = malloc(M * n * sizeof(unsigned char));
         bool early_unsat = false;
 
+        printf("Result:\n");
+
         #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < M; i++) {
             if (!early_unsat) {
@@ -215,13 +245,23 @@ int main(void) {
             printf("\n");
             continue;  // restarts at top of while
         }
-/*
-        if (!early_unsat) {
+
+/*        if (!early_unsat) {
             for (int i = 0; i < M; i++)
                 print_clause(sorted[i], forbidden, n, i);
         }*/
 
-        process_forbidden_set(M, n, forbidden);
+            bool has_any = get_assignments(M, n, forbidden);
+            if (!has_any) {
+                printf("Unsatisfiable, no gap or tail of the SAT instance\n");
+                // cleanup and restart loop
+                for (int i = 0; i < M; i++)
+                    free(clause[i].orig);
+                free(clause); free(seen); free(vars);
+                free(var_to_idx); free(sorted); free(forbidden);
+                printf("\n");
+                continue;  // restarts at top of while
+            }
 
         // cleanup
         for (int i = 0; i < M; i++)
